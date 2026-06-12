@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+from pathlib import Path
+import pandas as pd
+
+base_path = Path(r"C:\Users\\Documents\Personal\Monthly Exp")
+
+BACK = "__BACK__"
+RESTART = "__RESTART__"
+QUIT = "__QUIT__"
+
+
+def choose_from_list(prompt: str, options: list[str], *, allow_back=False, allow_restart=False, allow_quit=True) -> str:
+    while True:
+        print("\n" + prompt)
+        for i, name in enumerate(options, start=1):
+            print(f"{i:>2}. {name}")
+        if allow_back:
+            print(" B. Back")
+        if allow_restart:
+            print(" R. Main menu")
+        if allow_quit:
+            print(" Q. Quit")
+
+        raw = input("Select: ").strip().lower()
+
+        if allow_back and raw == "b":
+            return BACK
+        if allow_restart and raw == "r":
+            return RESTART
+        if allow_quit and raw == "q":
+            return QUIT
+
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+
+        print("Invalid selection. Try again.")
+
+
+def list_dirs(p: Path) -> list[str]:
+    return sorted([x.name for x in p.iterdir() if x.is_dir()])
+
+
+def list_files(p: Path, exts=None) -> list[str]:
+    exts = None if not exts else {e.lower() for e in exts}
+    out = []
+    for x in p.iterdir():
+        if not x.is_file():
+            continue
+        if exts is None:
+            out.append(x.name)
+        else:
+            if x.suffix.lower() in exts:
+                out.append(x.name)
+    return sorted(out)
+
+
+def pick_folder_and_file(base: Path, exts=None) -> Path:
+    years = list_dirs(base)
+    if not years:
+        raise FileNotFoundError(f"No folders found under: {base}")
+
+    while True:
+        year = choose_from_list(f"Choose a year folder under:\n{base}", years, allow_quit=True)
+        if year == QUIT:
+            raise SystemExit
+
+        year_path = base / year
+        months = list_dirs(year_path)
+        if not months:
+            print(f"No subfolders under {year_path}. Returning to main.")
+            continue
+
+        while True:
+            month = choose_from_list(
+                f"Choose a month folder under:\n{year_path}",
+                months,
+                allow_back=True,
+                allow_restart=True,
+                allow_quit=True,
+            )
+
+            if month == QUIT:
+                raise SystemExit
+            if month in (BACK, RESTART):
+                break
+
+            month_path = year_path / month
+            files = list_files(month_path, exts=exts)
+
+            print(f"\nScanning for files in: {month_path}")
+
+            if not files:
+                print("No files found here.")
+                continue
+
+            while True:
+                file_name = choose_from_list(
+                    f"Choose a file under:\n{month_path}",
+                    files,
+                    allow_back=True,
+                    allow_restart=True,
+                    allow_quit=True,
+                )
+
+                if file_name == QUIT:
+                    raise SystemExit
+                if file_name == BACK:
+                    break
+                if file_name == RESTART:
+                    month = RESTART
+                    break
+
+                return month_path / file_name
+
+            if month == RESTART:
+                break
+
+
+# ----------------------------
+# Normalization helpers
+# ----------------------------
+def _norm_col(c: str) -> str:
+    return str(c).strip().strip('"').lower()
+
+
+def _norm_cols(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
+    df2 = df.copy()
+    df2.columns = [str(c).strip().strip('"') for c in df2.columns]
+    mapping = {_norm_col(c): c for c in df2.columns}  # normalized -> original
+    return df2, mapping
+
+
+def _to_num(s) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _out(date_s, desc_s, amt_s) -> pd.DataFrame:
+    out = pd.DataFrame({"Date": date_s, "Description": desc_s, "Amount": _to_num(amt_s)})
+    return out.dropna(subset=["Date", "Amount"])
+
+
+# ----------------------------
+# 5 format processors
+# ----------------------------
+def process_format1(df: pd.DataFrame) -> pd.DataFrame | None:
+    # Posted Date,Reference Number,Payee,Address,Amount  (REVERT SIGN)
+    df2, m = _norm_cols(df)
+    need = {"posted date", "payee", "amount"}
+    if not need.issubset(m):
+        return None
+    out = _out(df2[m["posted date"]], df2[m["payee"]], -_to_num(df2[m["amount"]]))
+    return out
+
+
+def process_format2(df: pd.DataFrame) -> pd.DataFrame | None:
+    # Transaction Date,Posted Date,Description,Amount,...  (NO SIGN CHANGE)
+    df2, m = _norm_cols(df)
+    need = {"posted date", "description", "amount"}
+    if not need.issubset(m):
+        return None
+    # ensure it's this format (has Transaction Date or Raw Merchant Name etc.)
+    if "transaction date" not in m and "raw merchant name" not in m and "card last 4" not in m:
+        return None
+    return _out(df2[m["posted date"]], df2[m["description"]], df2[m["amount"]])
+
+
+def process_format3(df: pd.DataFrame) -> pd.DataFrame | None:
+    # Status,Date,Description,Debit,Credit,Member Name (NO SIGN CHANGE; use Debit if present else Credit)
+    df2, m = _norm_cols(df)
+    need = {"status", "date", "description", "debit", "credit"}
+    if not need.issubset(m):
+        return None
+
+    debit = _to_num(df2[m["debit"]])
+    credit = _to_num(df2[m["credit"]])
+    amount = debit.where(~debit.isna(), credit)
+
+    out = pd.DataFrame(
+        {
+            "Date": df2[m["date"]],
+            "Description": df2[m["description"]],
+            "Amount": amount,
+        }
+    )
+    return out.dropna(subset=["Date", "Description", "Amount"])
+
+
+def process_format4(df: pd.DataFrame) -> pd.DataFrame | None:
+    # Status,Date,Description,Debit,Credit (NO SIGN CHANGE; use Debit if present else Credit)
+    df2, m = _norm_cols(df)
+    need = {"status", "date", "description", "debit", "credit"}
+    if not need.issubset(m):
+        return None
+    # differentiate from format 3 by absence of "member name"
+    if "member name" in m:
+        return None
+
+    debit = _to_num(df2[m["debit"]])
+    credit = _to_num(df2[m["credit"]])
+    amount = debit.where(~debit.isna(), credit)
+
+    out = pd.DataFrame(
+        {
+            "Date": df2[m["date"]],
+            "Description": df2[m["description"]],
+            "Amount": amount,
+        }
+    )
+    return out.dropna(subset=["Date", "Description", "Amount"])
+
+
+def process_format5(df: pd.DataFrame) -> pd.DataFrame | None:
+    # "DATE","DESCRIPTION","AMOUNT","CHECK #","STATUS" (REVERT SIGN)
+    df2, m = _norm_cols(df)
+    need = {"date", "description", "amount", "status"}
+    if not need.issubset(m):
+        return None
+    # differentiate from formats 3/4 by missing debit/credit
+    if "debit" in m or "credit" in m:
+        return None
+
+    return _out(df2[m["date"]], df2[m["description"]], -_to_num(df2[m["amount"]]))
+
+
+# ----------------------------
+# Read + detect + convert
+# ----------------------------
+def read_csv_flexible(path: str | Path) -> pd.DataFrame:
+    path = str(path)
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        # try tab-delimited as fallback
+        return pd.read_csv(path, sep="\t")
+
+
+def read_and_process(path: str | Path) -> pd.DataFrame:
+    df = read_csv_flexible(path)
+
+    # order matters: detect the most specific ones first
+    for fn in (process_format1, process_format5, process_format2, process_format3, process_format4):
+        out = fn(df)
+        if out is not None:
+            return out
+
+    cols = ", ".join([str(c) for c in df.columns])
+    raise ValueError(f"Unknown file format. Columns seen: {cols}")
+
+
+def convert_one_file(input_path: Path) -> None:
+    print(f"\nProcessing file: {input_path}")
+    result = read_and_process(input_path)
+
+    in_path = Path(input_path)
+    output_path = in_path
+    old_path = in_path.with_name(f"{in_path.stem}_old{in_path.suffix}")
+
+    if old_path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing backup: {old_path}")
+
+    in_path.rename(old_path)
+    result.to_csv(output_path, index=False)
+
+    print(f"Renamed original to: {old_path}")
+    print(f"Wrote converted file to: {output_path}")
+
+
+# ----------------------------
+# MAIN LOOP (multi-file + quit)
+# ----------------------------
+while True:
+    try:
+        input_path = pick_folder_and_file(base_path, exts=None)
+    except SystemExit:
+        print("Exiting.")
+        break
+
+    try:
+        convert_one_file(Path(input_path))
+    except Exception as e:
+        print(f"Error converting {input_path}: {e}")
+
+    again = input("\nConvert another file? (Y to continue, Q to quit): ").strip().lower()
+    if again == "q":
+        print("Exiting.")
+        break
